@@ -3,35 +3,44 @@ import time
 import re
 import json
 from openai import OpenAI
+from prompts import PROMPT_BATCH_ANALYSIS, PROMPT_FINAL_MERGE, PROMPT_MIMIC_TRANSLATE
 from dotenv import load_dotenv
 
-from prompts import PROMPT_BATCH_ANALYSIS, PROMPT_FINAL_MERGE, PROMPT_MIMIC_TRANSLATE
-
-load_dotenv() 
+# --- 0. БЕЗОПАСНАЯ ЗАГРУЗКА КЛЮЧА ---
+# override=True заставляет Python перечитать файл, даже если старый ключ застрял в памяти
+load_dotenv(override=True) 
 
 api_key = os.getenv("OPENAI_API_KEY")
 
+# --- ДИАГНОСТИКА (ЧТОБЫ ТЫ ВИДЕЛ, КАКОЙ КЛЮЧ ЗАГРУЗИЛСЯ) ---
+if api_key:
+    # Показываем только хвостик ключа для проверки
+    print(f"🔑 DEBUG: Ключ успешно загружен. Концовка: ...{api_key[-4:]}")
+else:
+    print("❌ DEBUG: Файл .env прочитан, но переменная OPENAI_API_KEY пустая.")
+
 if not api_key:
-    print("❌ ОШИБКА: Не найден API ключ!")
-    print("1. Создайте файл .env рядом с main.py")
-    print("2. Напишите внутри: OPENAI_API_KEY=sk-proj-ваш_ключ")
+    print("\n❌ ОШИБКА: Не найден API ключ!")
+    print("1. Проверь, что файл называется ровно '.env' (а не .env.txt)")
+    print("2. Внутри должно быть: OPENAI_API_KEY=sk-proj-твой_ключ")
     exit()
 
 client = OpenAI(api_key=api_key)
 
 # --- НАСТРОЙКИ ---
 DIRS = {
-    "examples": "examples",       
-    "style": "style_guide",      
-    "input": "to_translate",      
-    "output": "output"           
+    "examples": "examples",       # Папка с примерами (source + target)
+    "style": "style_guide",       # Папка для DNA
+    "input": "to_translate",      # Папка с книгой для перевода
+    "output": "output"            # Папка для готового перевода
 }
 
-
+# Размер куска для анализа (gpt-4o-mini ест много и быстро)
 ANALYSIS_CHUNK_SIZE = 40000 
-
+# Размер куска для перевода (gpt-4o лучше работает с небольшими кусками)
 TRANSLATION_CHUNK_SIZE = 6000 
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def read_txt(path):
     try:
@@ -66,6 +75,7 @@ def call_llm(prompt, model="gpt-4o"):
             err_msg = str(e).lower()
             print(f"⚠️ API Error ({model}, попытка {attempt+1}): {e}")
             
+            # Если превышен лимит токенов — ждем дольше
             if "rate_limit" in err_msg or "429" in err_msg:
                 print("⏳ Лимит API превышен. Жду 20 секунд...")
                 time.sleep(20)
@@ -80,7 +90,7 @@ def split_text_smart(text, limit):
     current_chunk = []
     current_len = 0
     for p in paragraphs:
-
+        # +1 учитывает символ переноса строки
         if current_len + len(p) > limit and current_chunk:
             chunks.append("\n".join(current_chunk))
             current_chunk = []
@@ -90,6 +100,7 @@ def split_text_smart(text, limit):
     if current_chunk: chunks.append("\n".join(current_chunk))
     return chunks
 
+# --- ГЛУБОКИЙ АНАЛИЗ (DEEP SCAN) ---
 
 def perform_deep_scan():
     print("\n🕵️ НАЧИНАЮ ГЛУБОКОЕ СКАНИРОВАНИЕ ВСЕХ КНИГ...")
@@ -104,6 +115,7 @@ def perform_deep_scan():
         print("❌ Нет файлов в папке examples.")
         return None, None
 
+    # 1. СКАНИРОВАНИЕ (MAP) - Читаем все книги
     total_files = len(sources)
     for idx, src in enumerate(sources):
         tgt = src.replace("_source.txt", "_target.txt")
@@ -114,6 +126,7 @@ def perform_deep_scan():
         s_text = read_txt(os.path.join(DIRS["examples"], src))
         t_text = read_txt(os.path.join(DIRS["examples"], tgt))
         
+        # Сохраним кусочек для reference (пример тона)
         if len(full_reference_text) < 5000:
             full_reference_text += t_text[:5000]
 
@@ -126,14 +139,17 @@ def perform_deep_scan():
             print(f"      🔬 Анализ фрагмента {i+1}/{limit}...")
             combined_chunk = f"ORIGINAL:\n{s_chunks[i]}\n\nTRANSLATION:\n{t_chunks[i]}"
             
+            # ВАЖНО: Используем gpt-4o-mini для анализа. 
             notes = call_llm(PROMPT_BATCH_ANALYSIS.format(content_chunk=combined_chunk), model="gpt-4o-mini")
             if notes:
                 all_notes.append(notes)
 
+    # 2. СБОРКА (REDUCE) - Создаем DNA
     print("\n🧠 ОБЪЕДИНЯЮ ДАННЫЕ В ЕДИНЫЙ DNA...")
     
     raw_data = "\n\n=== ЗАМЕТКИ ===\n".join(all_notes)
     
+    # Умная логика: пробуем разные размеры, чтобы влезть в лимит
     try_limits = [160000, 80000, 40000] 
     
     final_json = None
@@ -142,6 +158,7 @@ def perform_deep_scan():
         print(f"   🔄 Пробую собрать DNA (объем данных: {limit} симв)...")
         safe_data = raw_data[:limit]
         
+        # Снова используем gpt-4o-mini для сборки большого объема
         final_json_str = call_llm(PROMPT_FINAL_MERGE.format(raw_notes=safe_data), model="gpt-4o-mini")
         cleaned = clean_json(final_json_str)
         
@@ -162,13 +179,15 @@ def perform_deep_scan():
     
     return final_json, full_reference_text
 
+# --- MAIN ---
 
 def main():
-
+    # Создаем папки если их нет
     for d in DIRS.values(): os.makedirs(d, exist_ok=True)
     
     dna_path = os.path.join(DIRS["style"], "translator_dna.json")
     
+    # Логика перезапуска
     if os.path.exists(dna_path):
         print("ℹ️ Найден существующий DNA.")
         choice = input("Пересоздать его заново (сканировать все книги)? (y/n): ")
@@ -182,6 +201,7 @@ def main():
 
     if not style_dna: return
 
+    # --- ПЕРЕВОД ---
     input_files = [f for f in os.listdir(DIRS["input"]) if f.endswith(".txt")]
     
     if not input_files:
@@ -203,17 +223,21 @@ def main():
                 source_text=chunk
             )
             
+            # ВАЖНО: Для самого перевода используем gpt-4o (максимальное качество)
             res = call_llm(prompt, model="gpt-4o") 
             res = clean_json(res)
             
             full_translation.append(res)
             
+            # Промежуточное сохранение
             save_txt(os.path.join(DIRS["output"], f"temp_{filename}"), "\n".join(full_translation))
 
+        # Финальное сохранение
         final_path = os.path.join(DIRS["output"], filename.replace(".txt", "_RU.txt"))
         save_txt(final_path, "\n".join(full_translation))
         print(f"🏁 ГОТОВО! Файл сохранен: {final_path}")
 
+        # Удаляем временный файл
         if os.path.exists(os.path.join(DIRS["output"], f"temp_{filename}")):
             os.remove(os.path.join(DIRS["output"], f"temp_{filename}"))
 
