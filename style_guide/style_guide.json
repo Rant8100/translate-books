@@ -1,0 +1,14 @@
+﻿{
+  "tone": null,
+  "voice": null,
+  "lexicon_rules": [],
+  "syntax_rules": [],
+  "dialogue_rules": [],
+  "terms_rules": [],
+  "profanity_policy": null,
+  "localization_policy": null,
+  "punctuation_rules": [],
+  "formatting_rules": [],
+  "do_not_list": [],
+  "examples_pairs": []
+}
